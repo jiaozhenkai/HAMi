@@ -373,6 +373,31 @@ func asResourceQuota(obj any) (*corev1.ResourceQuota, bool) {
 	}
 }
 
+// Start 启动调度器运行所需的本地状态与 K8s 事件订阅，是调度器进入服务态的入口。
+//
+// 它本身只做"建缓存 + 订阅事件 + 等同步"的初始化，完成后即返回，不会阻塞；
+// 持续运行由各 informer 的后台协程、leader 选举回调与 RegisterFromNodeAnnotations
+// 循环承担。启动的组件按顺序如下：
+//
+//  1. K8s 客户端 + 主 informer 工厂（defaultResync=1h）：为 Pod/Node/ResourceQuota
+//     三类资源建立本地缓存（Lister），后续 Filter/Score/Bind 的查询都走缓存而非直连 apiserver。
+//  2. 三组事件处理器，把集群变化翻译成调度器内部状态：
+//     - Pod   增/改/删  → 维护 podManager（已分配设备）与 quotaManager（用量）
+//     - Node  增/删     → doNodeNotify 向 nodeNotify 发信号，唤醒设备清单同步
+//     - Quota 增/改/删  → 维护 quotaManager
+//  3. informerFactory.Start + WaitForCacheSync：等三类资源本地缓存与各 handler 的
+//     HasSynced 全部就绪，避免在缓存未填满时基于不完整数据做调度决策。
+//  4. （可选）Lease informer + leader 选举：仅 config.LeaderElect=true 时启用，
+//     以独立工厂监听 LeaderElectResourceNamespace 下的 Lease 对象，把 leaderManager
+//     注册为事件处理器，实现多副本下"只有一个调度器参与注册与绑定"的主备语义。
+//     leaderManager 的 OnStartedLeading 回调会向 leaderNotify 发信号。
+//  5. addAllEventHandlers：创建 EventBroadcaster 与 eventRecorder，用于把
+//     调度结果（绑定成功/失败、NUMA refit 结果）作为 K8s Event 上报，供运维排查。
+//  6. s.started=1：放行 RegisterFromNodeAnnotations 中的同步循环——此前它因
+//     started==0 一直空转跳过，置 1 后才真正开始按节点注解同步设备清单。
+//
+// 任何一步失败都立即返回 error，由调用方决定退出；成功返回 nil 后调度器即可对外提供
+// /filter、/bind 等 HTTP 路由服务。退出时由 Stop() 关闭 stopCh，各 informer 随之停止。
 func (s *Scheduler) Start() error {
 	klog.InfoS("Starting HAMi scheduler components")
 	s.kubeClient = client.GetClient()
@@ -431,6 +456,19 @@ func (s *Scheduler) Stop() {
 	close(s.stopCh)
 }
 
+// RegisterFromNodeAnnotations 运行调度器的设备清单同步后台循环。
+//
+// 循环阻塞在四个事件源上，任一触发即执行一轮同步：
+//   - nodeNotify：节点增删改通知（来自 informer）
+//   - leaderNotify：主备切换通知（成为 leader 后才参与同步）
+//   - ticker.C：15 秒定时兜底，保证即使没有事件也能周期性刷新
+//   - stopCh：退出信号，收到即结束循环
+//
+// 每轮在调度器已启动（s.started==1）时调用 register() 执行实际同步工作：
+// 按标签选择器列出节点，从各厂商的节点注册注解（hami.io/node-{vendor}-register）
+// 中读取设备清单，经健康检查（CheckHealth）后更新 nodeManager 缓存，
+// 并重建节点用量快照（overviewstatus）。该缓存是 Filter/Bind 调度决策的设备视图
+// 来源，保证调度器看到的设备状态与集群实际状态保持一致。
 func (s *Scheduler) RegisterFromNodeAnnotations() {
 	klog.InfoS("Entering RegisterFromNodeAnnotations")
 	defer klog.InfoS("Exiting RegisterFromNodeAnnotations")
@@ -449,18 +487,22 @@ func (s *Scheduler) RegisterFromNodeAnnotations() {
 			klog.V(5).InfoS("Received leaderElection notification. We are just elected to leader")
 		case <-ticker.C:
 			klog.V(5).InfoS("Ticker triggered")
-		case <-s.stopCh:
+		case <-s.stopCh: // 收到停止信号才退出。
 			klog.InfoS("Received stop signal, exiting RegisterFromNodeAnnotations")
 			return
 		}
 		if atomic.LoadUint32(&s.started) == 0 {
 			klog.V(5).InfoS("Scheduler not started yet, skipping ...")
-			continue
+			continue // 调度器还没 Start 完，先空转跳过
 		}
 		s.register(labelSelector, printedLog)
 	}
 }
 
+/*
+每 15 秒或被事件唤醒时，把各节点上各厂商的设备清单（从 hami.io/node-{vendor}-register 注解读取）
+同步进调度器缓存，供 Filter/Bind 调度决策使用。
+*/
 func (s *Scheduler) register(labelSelector labels.Selector, printedLog map[string]bool) {
 	// Lock here to avoid setting s.synced to false, when we lost leadership, while doing register.
 	// 1. lost leadership before register: synced will set to false in callbacks, and register will be skipped because IsLeader() returns false

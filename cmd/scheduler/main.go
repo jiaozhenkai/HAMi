@@ -130,6 +130,11 @@ func start() error {
 		return fmt.Errorf("empty hostname returned")
 	}
 
+	/*
+		RegisterFromNodeAnnotations() 是一个永久阻塞的后台同步循环，
+		而 Start() 是一个做完初始化就返回的非阻塞函数。如果不用 go，
+		程序会卡死在循环里，永远无法启动 HTTP 服务。
+	*/
 	sher = scheduler.NewScheduler()
 	go sher.RegisterFromNodeAnnotations()
 	err = sher.Start()
@@ -139,6 +144,7 @@ func start() error {
 	defer sher.Stop()
 
 	// start monitor metrics
+	// metrics 也是个长驻 HTTP 服务，必须放后台跑，否则后面的主 HTTP router 就起不来。
 	go initMetrics(config.MetricsBindAddress, sher, legacyMetrics)
 
 	// start http server
@@ -193,6 +199,8 @@ func start() error {
 			ReadTimeout:       60 * time.Second,
 		}
 		klog.InfoS("Starting HTTPS server", "address", addr)
+		// ("", "") 表示"别从这俩文件路径读证书，改用我提前在 server.TLSConfig.GetCertificate 里挂好的
+		// certWatcher 回调取"——这样调度器跑着的时候证书文件被轮换也能实时生效，不用重启进程。
 		if err := server.ListenAndServeTLS("", ""); err != nil {
 			return fmt.Errorf("HTTPS server error: %w", err)
 		}
