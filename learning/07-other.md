@@ -71,7 +71,7 @@ done
 
 ---
 
-## main.go 读完后的精读路径
+# main.go 读完后的精读路径
 
 读 `cmd/scheduler/main.go` 时，你已经看到了调度器的**启动骨架**：初始化设备 → 建 Scheduler → 起缓存同步循环 → 起指标服务 → 注册 6 个 HTTP 路由 → 起服务。接下来最好的做法是**顺着请求流走**，而不是按目录乱读。
 
@@ -89,17 +89,19 @@ main.go(已读) → routes/route.go → scheduler.go:Filter → score.go:calcSco
 
 > 同文件里可以顺手扫一眼 `Bind()`（114 行）和 `NumaRefit()`（191 行），但**先别深入**，它们是 Filter 走通后的后续环节。
 
+progress: 已经读完
+
 ### 第 2 步：核心 `scheduler.go` 的 `Filter()`（第 1136 行）
 
 这是**整个项目最核心的函数**，顺着第 1 步的 `s.Filter()` 进来。建议把它分成 5 段，每段问自己一个问题：
 
-| 段落（按代码顺序） | 要搞清楚的问题 |
-|---|---|
-| ① 解析资源请求 | `device.Resourcereqs(pod)` 怎么从 Pod spec 算出"要几张 GPU、多少显存" |
-| ② 构建 NodeUsage 快照 | `getNodesUsage()`（813 行，可跳进去看一眼就回来）怎么把物理设备 + 已分配用量拼成每个节点的"剩余视图" |
-| ③ 并行评分 | `calcScore()` 怎么对所有候选节点打分 |
-| ④ 选节点+写注解 | 怎么按 binpack/spread 选最佳节点，然后 `PatchAnnotations` 把分配方案写成 Pod 注解 |
-| ⑤ 预留+回滚 | 怎么把这次分配记进 `podManager`/`quotaManager`，patch 失败怎么回滚 |
+| 段落（按代码顺序） | 要搞清楚的问题 | 答案 |
+|---|---|---|
+| ① 解析资源请求 | `device.Resourcereqs(pod)` 怎么从 Pod spec 算出"要几张 GPU、多少显存" | `Resourcereqs(pod)` 分两部分遍历 Pod 的容器——先遍历 init 容器，再遍历正式容器（正式容器下标从 init 容器数量处偏移）。对每个容器，遍历所有已注册厂商，调用其 `GenerateResourceRequests(ctr)` 接口，问"这个容器申请了你负责的资源吗"。每个厂商只认自己的资源名（nvidia 只认 `nvidia.com/gpu`），不认的返回 `Nums=0` 被过滤掉。返回的 `ContainerDeviceRequest` 含 5 个字段：设备张数 `Nums`、厂商类型 `Type`、显存 `Memreq`、显存百分比 `MemPercentagereq`、算力核数 `Coresreq`。结果按"容器下标 → 厂商名 → 请求明细"的三层 map 结构存进 `counts` 返回，供后续 filter 判断每个节点能否满足。 |
+| ② 构建 NodeUsage 快照 | `getNodesUsage()`（813 行，可跳进去看一眼就回来）怎么把物理设备 + 已分配用量拼成每个节点的"剩余视图" | todo |
+| ③ 并行评分 | `calcScore()` 怎么对所有候选节点打分 | todo |
+| ④ 选节点+写注解 | 怎么按 binpack/spread 选最佳节点，然后 `PatchAnnotations` 把分配方案写成 Pod 注解 | todo |
+| ⑤ 预留+回滚 | 怎么把这次分配记进 `podManager`/`quotaManager`，patch 失败怎么回滚 | todo |
 
 > 注意：之前读过的 `RegisterFromNodeAnnotations`（缓存同步）产出的 `nodeManager` 缓存，就是 ② `getNodesUsage()` 的数据来源——这一步正好把"后台同步"和"请求处理"两头接上了。
 

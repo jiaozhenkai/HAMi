@@ -31,6 +31,12 @@ import (
 	"github.com/Project-HAMi/HAMi/pkg/util"
 )
 
+/*
+Devices 接口让 HAMi 的调度核心逻辑与具体硬件解耦:
+调度器只认 device.Devices 接口,不关心是 NVIDIA 还是昇腾;
+加一个新厂商 = 新建目录 + 实现 14 个方法 + 在 config.go 加一行注册,不用动调度核心代码;
+这就是为什么 HAMi 能支持十几种异构硬件——接口是多态的支点,DevicesMap 是注册表,各厂商是可插拔实现。
+*/
 type Devices interface {
 	CommonWord() string
 	MutateAdmission(ctr *corev1.Container, pod *corev1.Pod) (bool, error)
@@ -220,11 +226,11 @@ type ContainerDevice struct {
 }
 
 type ContainerDeviceRequest struct {
-	Nums             int32
-	Type             string
-	Memreq           int32
-	MemPercentagereq int32
-	Coresreq         int32
+	Nums             int32  // 设备数量（几张卡）
+	Type             string // 厂商类型(如 "NVIDIA")
+	Memreq           int32  // 显存请求(多少 MB)
+	MemPercentagereq int32  // 显存百分比请求(占整卡显存的百分比)
+	Coresreq         int32  // 算力核请求(占整卡算力的百分比)
 }
 
 type ContainerDevices []ContainerDevice
@@ -682,13 +688,18 @@ func Resourcereqs(pod *corev1.Pod) (counts PodDeviceRequests) {
 
 	// Process init containers first (indices 0 to len(InitContainers)-1)
 	for i := range pod.Spec.InitContainers {
+		// devices = 所有已注册厂商(GetDevices() 返回 DevicesMap,里面有 NVIDIA、寒武纪、昇腾等十几个);
 		devices := GetDevices()
 		counts[i] = make(ContainerDeviceRequests)
 		klog.V(5).InfoS("Processing init container resources",
 			"pod", klog.KObj(pod),
 			"containerIndex", i,
 			"containerName", pod.Spec.InitContainers[i].Name)
+		// 一个 Pod 可以同时申请多种硬件的设备，所以必须遍历所有已注册的厂商
+		// val = 某一个具体厂商的实现(多态,val 的静态类型是 Devices 接口,动态类型可能是 *NvidiaGPUDevices)
+		// idx = 厂商名字，比如 NVIDIA
 		for idx, val := range devices {
+			// val.GenerateResourceRequests(ctr) = 问这个厂商:"这个容器的 resources 里有你负责的资源吗?有就告诉我数量,没有返回 0"
 			request := val.GenerateResourceRequests(&pod.Spec.InitContainers[i])
 			if request.Nums > 0 {
 				cnt += request.Nums
@@ -714,11 +725,14 @@ func Resourcereqs(pod *corev1.Pod) (counts PodDeviceRequests) {
 			}
 		}
 	}
+	// cnt 只判断看是否有请求了卡，是一个总体值，不参与返回值。
 	if cnt == 0 {
 		klog.V(4).InfoS("No device requests found", "pod", klog.KObj(pod))
 	} else {
 		klog.V(4).InfoS("Resource requirements collected", "pod", klog.KObj(pod), "requests", counts)
+		klog.V(4).InfoS("Learning add.", "cnt is: ", cnt)
 	}
+	// counts 真正记录请求清单。
 	return counts
 }
 

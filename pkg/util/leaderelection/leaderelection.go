@@ -25,9 +25,16 @@ import (
 	"k8s.io/client-go/tools/cache"
 )
 
+// LeaderCallbacks 封装主备切换时的两个回调，供使用方（如 scheduler）在
+// 当选/失主时执行自定义逻辑。回调由 leaderManager 在 Lease 事件处理中触发，
+// 且在锁外执行，避免回调阻塞 Lease 的后续更新。
 type LeaderCallbacks struct {
+	// OnStartedLeading 在本实例当选 leader 时调用。
+	// 触发时机：lease 新建时本机已是 holder，或 lease 更新后 holder 切换到本机。
 	// OnStartedLeading is called when starts leading
 	OnStartedLeading func()
+	// OnStoppedLeading 在本实例失去 leader 身份时调用。
+	// 触发时机：lease 更新后 holder 切到别的节点，或 lease 被删除。
 	// OnStoppedLeading is called when stops leading
 	OnStoppedLeading func()
 }

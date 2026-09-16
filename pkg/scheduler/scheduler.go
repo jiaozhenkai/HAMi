@@ -74,8 +74,11 @@ type Scheduler struct {
 	leaseLister coordinationv1.LeaseLister
 	//Node Overview
 	overviewstatus map[string]*NodeUsage
-	eventRecorder  record.EventRecorder
-	started        uint32 // 0 = false, 1 = true
+	// eventRecorder 把调度结果（绑定成功/失败、过滤失败、NUMA refit 结果）作为
+	// K8s Event 上报，供 kubectl describe pod 排查。在 Start() → addAllEventHandlers()
+	// 里由 EventBroadcaster 创建；可能为 nil（NUMA refit/filter 路径需判空）。
+	eventRecorder record.EventRecorder
+	started       uint32 // 0 = false, 1 = true
 
 	lock   sync.RWMutex
 	synced atomic.Bool
@@ -85,6 +88,11 @@ type Scheduler struct {
 	// usage. kube-scheduler already serializes Filter calls per scheduling
 	// cycle, so in the common path this adds no contention; it exists so these
 	// paths cannot observe or produce half-applied accounting.
+	//
+	// 预占记账锁：串行化 Filter、NUMA refit、pod 更新（释放 init 容器用量）三处
+	// 对 podManager/quotaManager 的读写。kube-scheduler 每个 scheduling cycle
+	// 已串行调用 Filter，正常路径无竞争；此锁防止 refit 读到 release 前的旧快照、
+	// 或 pod 更新与 refit 交叉产生"半应用"的记账状态。（NUMA refit 和 pod 更新是异步事件,可能和 Filter 交叉,这把锁确保它们不会读到或产生"改了一半"的记账状态。这是为正确性而非性能加的锁。）
 	allocLock sync.Mutex
 }
 
@@ -720,6 +728,9 @@ func numaBindingRequested(task *corev1.Pod) bool {
 	return err == nil && enforce
 }
 
+// 把节点设备清单里的静态信息(总显存、总算力、型号、NUMA、健康)拷进 DeviceUsage,
+// 同时把所有"已用量"字段(Used/Usedmem/Usedcores 以及 Score)全部置 0。
+// 造出一份"空用量"的 NodeUsage 骨架,供后续打分或模拟分配时叠加实际用量。
 func buildNodeUsage(node *device.NodeInfo, task *corev1.Pod) *NodeUsage {
 	userGPUPolicy := util.GetGPUSchedulerPolicyByPod(device.GPUSchedulerPolicy, task)
 	nodeUsage := &NodeUsage{
@@ -734,6 +745,7 @@ func buildNodeUsage(node *device.NodeInfo, task *corev1.Pod) *NodeUsage {
 	for _, vendorDevices := range node.Devices {
 		for _, d := range vendorDevices {
 			nodeUsage.Devices.DeviceLists = append(nodeUsage.Devices.DeviceLists, &policy.DeviceListsScore{
+				// 清零已用量、保留总容量
 				Score: 0,
 				Device: &device.DeviceUsage{
 					ID:          d.ID,
@@ -758,10 +770,11 @@ func buildNodeUsage(node *device.NodeInfo, task *corev1.Pod) *NodeUsage {
 	return nodeUsage
 }
 
+// 这个函数的作用是？
 func buildTransientNodeInfo(node *corev1.Node) (*device.NodeInfo, error) {
 	nodeInfo := &device.NodeInfo{
 		ID:      node.Name,
-		Node:    node.DeepCopy(),
+		Node:    node.DeepCopy(), // 避免后续 score 阶段模拟分配时修改到原始 NodeList、污染调用方的数据。
 		Devices: make(map[string][]device.DeviceInfo),
 	}
 	for _, devInstance := range device.GetDevices() {
@@ -944,6 +957,7 @@ func (s *Scheduler) getSimulationNodesUsage(nodes *corev1.NodeList, task *corev1
 		"nodesLen", len(nodes.Items))
 	for i := range nodes.Items {
 		node := &nodes.Items[i]
+		// 这里为什么调用这个函数，而且里面还有 deepcopy
 		nodeInfo, err := buildTransientNodeInfo(node)
 		if err != nil {
 			klog.V(4).InfoS("Simulation node rejected during transient node construction",
@@ -1133,12 +1147,16 @@ func (s *Scheduler) Bind(args extenderv1.ExtenderBindingArgs) (*extenderv1.Exten
 	return &extenderv1.ExtenderBindingResult{Error: ""}, nil
 }
 
+// 过滤 + 打分放到了一个函数中
+// extenderv1.ExtenderArgs 是值传递，因为内部都是指针，而且值传递有防御性拷贝的好处，
+// Filter 内部就算对 args 这个局部变量做了什么赋值(args.NodeNames = nil 之类),也不会影响调用方的 extenderArgs。这是值传递天然的隔离。对一个 HTTP handler 来说,被调函数不会意外污染调用栈的局部变量。
 func (s *Scheduler) Filter(args extenderv1.ExtenderArgs) (*extenderv1.ExtenderFilterResult, error) {
 	klog.InfoS("Starting schedule filter process", "pod", args.Pod.Name, "uuid", args.Pod.UID, "namespace", args.Pod.Namespace)
 	resourceReqs := device.Resourcereqs(args.Pod)
 
 	hasHAMiResource := false
 
+	// 任意一个厂商的 GPU 有定义，就认为 pod 有请求 HAMi 资源
 	for _, reqMap := range resourceReqs {
 		if len(reqMap) > 0 {
 			hasHAMiResource = true
@@ -1146,6 +1164,7 @@ func (s *Scheduler) Filter(args extenderv1.ExtenderArgs) (*extenderv1.ExtenderFi
 		}
 	}
 
+	// 没有 HAMi 资源难到不是不应该让请求走到 HAMi scheduler 吗？
 	if !hasHAMiResource {
 		klog.V(1).InfoS("Pod does not request any resources", "pod", args.Pod.Name)
 		// Simulation callers such as the cluster autoscaler send Nodes
@@ -1158,6 +1177,11 @@ func (s *Scheduler) Filter(args extenderv1.ExtenderArgs) (*extenderv1.ExtenderFi
 			Error:       "",
 		}, nil
 	}
+	// 正常生产时 kube-scheduler 配了 nodeCacheCapable: true,只发 NodeNames(节点名),
+	// HAMi 从自己的 nodeManager 缓存里拿设备清单——缓存是后台 register() 循环早就建好的。
+	// 但模拟器(如 cluster autoscaler、调度仿真工具)不走这套:它们直接发完整的 NodeList 给 HAMi,
+	// 这些 Node 对象不在 HAMi 的 nodeManager 缓存里,HAMi 手上没有它们的设备清单,
+	// 所以必须现场从这些 Node 对象构建出 NodeInfo
 	if args.Nodes != nil {
 		return s.filterSimulation(args, resourceReqs)
 	}

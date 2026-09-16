@@ -19,7 +19,9 @@ package device
 import (
 	"encoding/json"
 	"errors"
+	"flag"
 	"fmt"
+	"os"
 	"strings"
 	"testing"
 
@@ -27,9 +29,23 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/klog/v2"
 
 	"github.com/Project-HAMi/HAMi/pkg/util"
 )
+
+// TestMain configures klog so that V(4)/V(5) logs emitted by the code under
+// test are streamed to stderr. Without this, klog defaults to a log file and
+// go test buffers stdout, so klog output is invisible during tests.
+//
+// Run with: go test ./pkg/device/... -v -args -v=5
+// 学习添加，为了在测试时能把日志打印出来。
+func TestMain(m *testing.M) {
+	klog.InitFlags(nil)
+	_ = flag.Set("logtostderr", "true") // klog -> stderr (not buffered by go test)
+	_ = flag.Set("v", "5")              // emit V(5) and below
+	os.Exit(m.Run())
+}
 
 var inRequestDevices map[string]string
 

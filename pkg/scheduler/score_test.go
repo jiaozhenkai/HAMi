@@ -17,6 +17,7 @@ limitations under the License.
 package scheduler
 
 import (
+	"flag"
 	"strconv"
 	"strings"
 	"testing"
@@ -40,6 +41,12 @@ import (
 )
 
 func TestMain(m *testing.M) {
+	// Configure klog so V(n) logs emitted by the code under test are streamed
+	// to stderr (go test buffers stdout). Raise v when debugging specific tests.
+	klog.InitFlags(nil)
+	_ = flag.Set("logtostderr", "true")
+	_ = flag.Set("v", "3")
+
 	sConfig := &config.Config{
 		NvidiaConfig: nvidia.NvidiaConfig{
 			ResourceCountName:            "hami.io/gpu",
